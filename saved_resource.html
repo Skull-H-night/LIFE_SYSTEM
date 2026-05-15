@@ -1,0 +1,1490 @@
+<!DOCTYPE html>
+<!-- saved from url=(0012)about:srcdoc -->
+<html lang="en"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Life System">
+<meta name="theme-color" content="#0a0a0f">
+<title>⚡ Life System — Cairo 2026</title>
+<link rel="preconnect" href="https://fonts.googleapis.com/">
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&amp;family=Space+Mono:wght@400;700&amp;display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #080810;
+    --surface: #0f0f1a;
+    --card: #13131f;
+    --border: #1c1c2e;
+    --border2: #252538;
+    --accent: #7c6fff;
+    --accent2: #00e5b0;
+    --accent3: #ff5f5f;
+    --accent4: #ffd166;
+    --accent5: #b8a4ff;
+    --text: #e8e6f0;
+    --muted: #5a5870;
+    --muted2: #8885a0;
+    --green: #1dce7a;
+    --prayer: #ffd166;
+    --career: #7c6fff;
+    --deutsch: #00e5b0;
+    --english: #b8a4ff;
+    --workout: #ff5f5f;
+    --reading: #ff9a3c;
+    --sleep: #5ba4f5;
+    --diet: #1dce7a;
+    --routine: #7a7a9a;
+    --health: #2de0a5;
+    --radius: 14px;
+    --radius-sm: 8px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font-family: 'Syne', sans-serif; }
+
+  /* SCROLLBAR */
+  ::-webkit-scrollbar { width: 4px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+  /* APP SHELL */
+  #app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
+
+  /* HEADER */
+  .header {
+    background: linear-gradient(135deg, #0d0d1f 0%, #111128 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 14px 18px 12px;
+    flex-shrink: 0;
+    position: relative;
+    overflow: hidden;
+  }
+  .header::before {
+    content: '';
+    position: absolute;
+    top: -40px; right: -40px;
+    width: 140px; height: 140px;
+    background: radial-gradient(circle, rgba(124,111,255,0.15) 0%, transparent 70%);
+    pointer-events: none;
+  }
+  .header-top { display: flex; align-items: center; justify-content: space-between; }
+  .header-logo { display: flex; align-items: center; gap: 10px; }
+  .logo-icon {
+    width: 38px; height: 38px; border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    display: flex; align-items: center; justify-content: center;
+    font-size: 18px; flex-shrink: 0;
+    box-shadow: 0 4px 15px rgba(124,111,255,0.3);
+  }
+  .header-title { font-size: 17px; font-weight: 800; letter-spacing: -0.3px; }
+  .header-sub { font-size: 11px; color: var(--muted2); margin-top: 1px; font-family: 'Space Mono', monospace; }
+  .header-date {
+    font-family: 'Space Mono', monospace;
+    font-size: 11px; color: var(--accent2);
+    background: rgba(0,229,176,0.08);
+    border: 1px solid rgba(0,229,176,0.2);
+    padding: 5px 10px; border-radius: 20px;
+    text-align: right;
+  }
+  .header-stats {
+    display: flex; gap: 8px; margin-top: 12px; overflow-x: auto;
+    scrollbar-width: none; padding-bottom: 2px;
+  }
+  .header-stats::-webkit-scrollbar { display: none; }
+  .stat-pill {
+    flex-shrink: 0;
+    background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border2);
+    border-radius: 20px;
+    padding: 5px 12px;
+    font-size: 11px;
+  }
+  .stat-pill span { color: var(--accent2); font-weight: 700; }
+
+  /* PROGRESS BAR */
+  .progress-bar-wrap { margin-top: 10px; }
+  .progress-label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted2); margin-bottom: 5px; }
+  .progress-track { height: 4px; background: var(--border2); border-radius: 4px; overflow: hidden; }
+  .progress-fill { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent2)); border-radius: 4px; transition: width 0.4s ease; }
+
+  /* NAV TABS */
+  .nav {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex; overflow-x: auto;
+    scrollbar-width: none; flex-shrink: 0;
+  }
+  .nav::-webkit-scrollbar { display: none; }
+  .nav-btn {
+    flex-shrink: 0; background: none; border: none;
+    color: var(--muted); padding: 12px 16px;
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s; font-family: 'Syne', sans-serif;
+    white-space: nowrap;
+  }
+  .nav-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* CONTENT */
+  .content { flex: 1; overflow-y: auto; padding: 16px; }
+
+  /* CARDS */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px;
+    margin-bottom: 12px;
+  }
+  .card-title { font-size: 13px; font-weight: 700; color: var(--muted2); text-transform: uppercase; letter-spacing: 0.8px; margin-bottom: 12px; }
+
+  /* TASK ITEMS */
+  .task-item {
+    display: flex; align-items: flex-start; gap: 12px;
+    padding: 11px 14px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 6px;
+    cursor: pointer;
+    transition: all 0.18s;
+    border-left-width: 3px;
+    -webkit-user-select: none; user-select: none;
+  }
+  .task-item:active { transform: scale(0.99); opacity: 0.85; }
+  .task-item.done { opacity: 0.55; background: rgba(29,206,122,0.04); }
+  .task-checkbox {
+    width: 20px; height: 20px; border-radius: 6px;
+    border: 2px solid var(--muted);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0; margin-top: 1px; font-size: 11px;
+    transition: all 0.2s;
+  }
+  .task-item.done .task-checkbox { background: var(--green); border-color: var(--green); color: #000; }
+  .task-time { font-family: 'Space Mono', monospace; font-size: 11px; color: var(--accent2); font-weight: 700; white-space: nowrap; }
+  .task-dur { font-size: 10px; color: var(--muted); margin-top: 1px; }
+  .task-text { font-size: 13px; line-height: 1.4; }
+  .task-item.done .task-text { text-decoration: line-through; color: var(--muted); }
+  .badge-critical {
+    font-size: 9px; background: rgba(255,95,95,0.15); color: var(--accent3);
+    padding: 2px 7px; border-radius: 20px; font-weight: 700;
+    margin-top: 3px; display: inline-block; letter-spacing: 0.5px;
+  }
+
+  /* SECTION HEADERS */
+  .section-label {
+    font-family: 'Space Mono', monospace;
+    font-size: 10px; color: var(--muted2);
+    text-transform: uppercase; letter-spacing: 1.5px;
+    padding: 14px 0 8px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .section-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+  /* WEEK CARDS */
+  .week-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 10px; overflow: hidden; }
+  .week-card-header { padding: 12px 16px; font-weight: 800; font-size: 15px; display: flex; align-items: center; gap: 10px; }
+  .week-day-badge { width: 38px; height: 38px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 800; }
+  .week-card-body { padding: 0 16px 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .week-mini { background: rgba(255,255,255,0.03); border-radius: 8px; padding: 9px 11px; }
+  .week-mini-label { font-size: 10px; font-weight: 700; margin-bottom: 3px; letter-spacing: 0.5px; }
+  .week-mini-val { font-size: 12px; color: var(--text); line-height: 1.4; }
+
+  /* MONTH CARDS */
+  .month-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
+  .month-card-header { padding: 14px 18px; display: flex; align-items: center; gap: 12px; }
+  .month-num { width: 34px; height: 34px; border-radius: 9px; display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 15px; }
+  .month-card-body { padding: 0 18px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .month-row { display: flex; gap: 10px; font-size: 13px; }
+  .month-icon { width: 60px; color: var(--muted2); flex-shrink: 0; }
+
+  /* DIET */
+  .meal-card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; margin-bottom: 8px; display: flex; gap: 12px; align-items: flex-start; }
+  .meal-time-badge { background: rgba(29,206,122,0.12); color: var(--green); border-radius: 7px; padding: 5px 10px; font-family: 'Space Mono', monospace; font-size: 11px; font-weight: 700; white-space: nowrap; }
+  .meal-name { font-weight: 700; font-size: 13px; margin-bottom: 3px; }
+  .meal-items { font-size: 12px; color: var(--muted2); line-height: 1.5; }
+
+  /* REMINDERS */
+  .reminder-item { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 15px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center; }
+  .reminder-time { font-family: 'Space Mono', monospace; font-size: 12px; color: var(--accent2); font-weight: 700; }
+  .reminder-label { font-size: 13px; margin-top: 2px; }
+  .repeat-badge { font-size: 10px; background: rgba(124,111,255,0.12); color: var(--accent5); padding: 3px 9px; border-radius: 20px; }
+
+  /* INFO BOXES */
+  .info-box { border-radius: var(--radius); padding: 14px 16px; margin-bottom: 14px; }
+  .info-box.purple { background: rgba(124,111,255,0.08); border: 1px solid rgba(124,111,255,0.2); }
+  .info-box.green { background: rgba(0,229,176,0.07); border: 1px solid rgba(0,229,176,0.2); }
+  .info-box.red { background: rgba(255,95,95,0.07); border: 1px solid rgba(255,95,95,0.2); }
+  .info-box.yellow { background: rgba(255,209,102,0.07); border: 1px solid rgba(255,209,102,0.2); }
+  .info-box-title { font-weight: 800; font-size: 13px; margin-bottom: 7px; }
+  .info-box.purple .info-box-title { color: var(--accent5); }
+  .info-box.green .info-box-title { color: var(--accent2); }
+  .info-box.red .info-box-title { color: var(--accent3); }
+  .info-box.yellow .info-box-title { color: var(--accent4); }
+  .info-box p, .info-box li { font-size: 13px; color: var(--text); line-height: 1.75; }
+  .info-box ol, .info-box ul { padding-left: 18px; }
+
+  /* SETUP STEPS */
+  .setup-step { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 13px 15px; margin-bottom: 8px; display: flex; gap: 12px; }
+  .step-num { width: 28px; height: 28px; border-radius: 7px; background: var(--accent); display: flex; align-items: center; justify-content: center; font-weight: 800; font-size: 13px; flex-shrink: 0; color: #fff; }
+  .step-title { font-weight: 700; font-size: 14px; }
+  .step-desc { font-size: 12px; color: var(--muted2); margin-top: 3px; line-height: 1.5; }
+
+  /* RULES */
+  .rule-item { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px; line-height: 1.6; }
+  .rule-num { color: var(--accent3); font-weight: 800; font-family: 'Space Mono', monospace; width: 20px; flex-shrink: 0; }
+  .rule-item:last-child { border-bottom: none; }
+
+  /* BOTTOM INSTALL BANNER */
+  .install-banner {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: linear-gradient(135deg, #1a1535, #1a2535);
+    border-top: 1px solid var(--border2);
+    padding: 14px 18px;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; z-index: 100;
+    animation: slideUp 0.4s ease;
+  }
+  @keyframes slideUp { from { transform: translateY(100%); } to { transform: translateY(0); } }
+  .install-text { font-size: 13px; line-height: 1.4; }
+  .install-text strong { color: var(--accent2); }
+  .install-btn {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #fff; border: none; padding: 9px 18px;
+    border-radius: 20px; font-size: 13px; font-weight: 700;
+    cursor: pointer; white-space: nowrap; font-family: 'Syne', sans-serif;
+    flex-shrink: 0;
+  }
+  .install-close { background: none; border: none; color: var(--muted); font-size: 18px; cursor: pointer; padding: 4px; flex-shrink: 0; }
+
+  /* SCORE BOX */
+  .score-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-top: 10px; }
+  .score-cell { background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 9px; padding: 10px; text-align: center; }
+  .score-val { font-size: 22px; font-weight: 800; font-family: 'Space Mono', monospace; color: var(--accent2); }
+  .score-key { font-size: 10px; color: var(--muted2); margin-top: 3px; }
+
+  /* FLOATING DONE COUNTER */
+  .done-counter {
+    position: sticky; top: 0; z-index: 10;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 10px 16px;
+    display: flex; align-items: center; justify-content: space-between;
+    margin: -16px -16px 12px;
+  }
+  .done-text { font-size: 13px; }
+  .done-text strong { color: var(--accent2); font-family: 'Space Mono', monospace; }
+  .reset-btn { font-size: 11px; background: none; border: 1px solid var(--border2); color: var(--muted2); padding: 4px 12px; border-radius: 20px; cursor: pointer; font-family: 'Syne', sans-serif; }
+
+  /* CHECKLIST TAB */
+  .check-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); cursor: pointer; }
+  .check-row:last-child { border-bottom: none; }
+  .check-box { width: 18px; height: 18px; border-radius: 5px; border: 2px solid var(--muted); flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 10px; transition: all 0.2s; }
+  .check-row.checked .check-box { background: var(--green); border-color: var(--green); color: #000; }
+  .check-row.checked .check-label { text-decoration: line-through; color: var(--muted); }
+  .check-label { font-size: 13px; line-height: 1.4; }
+
+  @media (min-width: 600px) {
+    .content { max-width: 680px; margin: 0 auto; }
+    .week-card-body { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<div id="app">
+
+  <!-- HEADER -->
+  <div class="header">
+    <div class="header-top">
+      <div class="header-logo">
+        <div class="logo-icon">⚡</div>
+        <div>
+          <div class="header-title">LIFE SYSTEM</div>
+          <div class="header-sub">Cairo 2026 — 4:00 AM Every Day</div>
+        </div>
+      </div>
+      <div class="header-date" id="headerDate">Fri<br>15 May</div>
+    </div>
+    <div class="header-stats">
+      <div class="stat-pill">🎯 Interview <span id="daysLeft">29</span> days</div>
+      <div class="stat-pill">🏋️ V-Shape <span>90</span> days</div>
+      <div class="stat-pill">🕌 Prayers <span>6×</span> daily</div>
+      <div class="stat-pill">😴 Sleep <span>4h</span>/day</div>
+    </div>
+    <div class="progress-bar-wrap">
+      <div class="progress-label">
+        <span>Today's progress</span>
+        <span id="progressLabel">1 / 36 tasks</span>
+      </div>
+      <div class="progress-track"><div class="progress-fill" id="progressFill" style="width: 3%;"></div></div>
+    </div>
+  </div>
+
+  <!-- NAV -->
+  <div class="nav">
+    <button class="nav-btn active" onclick="showTab(&#39;schedule&#39;)">📅 Schedule</button>
+    <button class="nav-btn" onclick="showTab(&#39;week&#39;)">📆 Weekly</button>
+    <button class="nav-btn" onclick="showTab(&#39;month&#39;)">🗓️ Roadmap</button>
+    <button class="nav-btn" onclick="showTab(&#39;diet&#39;)">🥗 Diet</button>
+    <button class="nav-btn" onclick="showTab(&#39;reminders&#39;)">⏰ Alarms</button>
+    <button class="nav-btn" onclick="showTab(&#39;setup&#39;)">📱 Setup</button>
+    <button class="nav-btn" onclick="showTab(&#39;rules&#39;)">🧠 Rules</button>
+  </div>
+
+  <!-- CONTENT -->
+  <div class="content" id="contentArea"><div class="done-counter">
+    <div class="done-text">✅ <strong>1</strong> / 36 done today</div>
+    <button class="reset-btn" onclick="resetDay()">Reset day</button>
+  </div><div class="section-label">🌅 Morning Block — 4:00 AM to 12:00 PM</div><div class="task-item done" data-idx="0" style="border-left-color:#7a7a9a">
+        <div class="task-checkbox">✓</div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">4:00 AM</span>
+            <span class="task-dur">25 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">🌅 WAKE UP — Cold water, brush, freshen up</div>
+        </div>
+      </div><div class="task-item " data-idx="1" style="border-left-color:#ffd166">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">4:25 AM</span>
+            <span class="task-dur">20 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">🕌 Fajr Prayer + Duaa</div>
+        </div>
+      </div><div class="task-item " data-idx="2" style="border-left-color:#ff9a3c">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">4:45 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">📖 Reading — Session 1 (20 pages)</div>
+        </div>
+      </div><div class="task-item " data-idx="3" style="border-left-color:#00e5b0">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">5:15 AM</span>
+            <span class="task-dur">15 min</span>
+            
+          </div>
+          <div class="task-text">🇩🇪 Deutsch — Vocabulary (Anki, 20 new words)</div>
+        </div>
+      </div><div class="task-item " data-idx="4" style="border-left-color:#b8a4ff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">5:30 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🇬🇧 English — Podcast listening (no phone, just listen)</div>
+        </div>
+      </div><div class="task-item " data-idx="5" style="border-left-color:#7c6fff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">6:00 AM</span>
+            <span class="task-dur">90 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">💻 ISTQB Study — Deep focus (chapter of the week)</div>
+        </div>
+      </div><div class="task-item " data-idx="6" style="border-left-color:#2de0a5">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">7:30 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🚶 Morning Walk — outdoors, no phone</div>
+        </div>
+      </div><div class="task-item " data-idx="7" style="border-left-color:#1dce7a">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">8:00 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🥗 Breakfast — High protein meal</div>
+        </div>
+      </div><div class="task-item " data-idx="8" style="border-left-color:#7c6fff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">8:30 AM</span>
+            <span class="task-dur">60 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">💻 Tools Study — Postman / Selenium / IBM DOORS</div>
+        </div>
+      </div><div class="task-item " data-idx="9" style="border-left-color:#00e5b0">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">9:30 AM</span>
+            <span class="task-dur">45 min</span>
+            
+          </div>
+          <div class="task-text">🇩🇪 Deutsch — Grammar lesson (YouTube)</div>
+        </div>
+      </div><div class="task-item " data-idx="10" style="border-left-color:#b8a4ff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">10:15 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🇬🇧 English — Speaking practice (shadowing, repeat aloud)</div>
+        </div>
+      </div><div class="task-item " data-idx="11" style="border-left-color:#ff9a3c">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">10:45 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">📖 Reading — Session 2 (20 pages)</div>
+        </div>
+      </div><div class="task-item " data-idx="12" style="border-left-color:#ff5f5f">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">11:15 AM</span>
+            <span class="task-dur">60 min</span>
+            
+          </div>
+          <div class="task-text">🏋️ GYM — Follow weekly split</div>
+        </div>
+      </div><div class="task-item " data-idx="13" style="border-left-color:#1dce7a">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">12:15 PM</span>
+            <span class="task-dur">20 min</span>
+            
+          </div>
+          <div class="task-text">🍗 Post-workout meal — protein + carbs</div>
+        </div>
+      </div><div class="section-label">🌞 Afternoon Block — 12:35 PM to 5:30 PM</div><div class="task-item " data-idx="14" style="border-left-color:#ffd166">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">12:35 PM</span>
+            <span class="task-dur">20 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">🕌 Dhuhr Prayer + rest</div>
+        </div>
+      </div><div class="task-item " data-idx="15" style="border-left-color:#5ba4f5">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">12:55 PM</span>
+            <span class="task-dur">90 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">😴 Sleep Block 1 — REST (90 minutes)</div>
+        </div>
+      </div><div class="task-item " data-idx="16" style="border-left-color:#7c6fff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">2:25 PM</span>
+            <span class="task-dur">60 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">💻 Python for Testing — pytest, scripts</div>
+        </div>
+      </div><div class="task-item " data-idx="17" style="border-left-color:#00e5b0">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">3:25 PM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🇩🇪 Deutsch — Listening (Easy German YouTube)</div>
+        </div>
+      </div><div class="task-item " data-idx="18" style="border-left-color:#b8a4ff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">3:55 PM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🇬🇧 English — Writing practice (1 paragraph journal)</div>
+        </div>
+      </div><div class="task-item " data-idx="19" style="border-left-color:#ffd166">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">4:25 PM</span>
+            <span class="task-dur">10 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">🕌 Asr Prayer</div>
+        </div>
+      </div><div class="task-item " data-idx="20" style="border-left-color:#ff9a3c">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">4:35 PM</span>
+            <span class="task-dur">40 min</span>
+            
+          </div>
+          <div class="task-text">📖 Reading — Session 3 (20 pages)</div>
+        </div>
+      </div><div class="task-item " data-idx="21" style="border-left-color:#00e5b0">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">5:15 PM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🎧 Deutsch — Podcast / audio story (passive)</div>
+        </div>
+      </div><div class="section-label">🌆 Evening Block — 5:45 PM to 1:30 AM</div><div class="task-item " data-idx="22" style="border-left-color:#7c6fff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">5:45 PM</span>
+            <span class="task-dur">60 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">💻 Mock Testing / Practice ISTQB questions</div>
+        </div>
+      </div><div class="task-item " data-idx="23" style="border-left-color:#1dce7a">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">6:45 PM</span>
+            <span class="task-dur">45 min</span>
+            
+          </div>
+          <div class="task-text">🥩 Dinner — lean protein + vegetables</div>
+        </div>
+      </div><div class="task-item " data-idx="24" style="border-left-color:#ffd166">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">7:40 PM</span>
+            <span class="task-dur">15 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">🕌 Maghrib Prayer + Duaa</div>
+        </div>
+      </div><div class="task-item " data-idx="25" style="border-left-color:#00e5b0">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">7:45 PM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🇩🇪 Deutsch — Speaking (repeat sentences aloud, record)</div>
+        </div>
+      </div><div class="task-item " data-idx="26" style="border-left-color:#b8a4ff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">8:15 PM</span>
+            <span class="task-dur">45 min</span>
+            
+          </div>
+          <div class="task-text">🇬🇧 English — YouTube native content (no subtitles)</div>
+        </div>
+      </div><div class="task-item " data-idx="27" style="border-left-color:#ffd166">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">9:10 PM</span>
+            <span class="task-dur">10 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">🕌 Isha Prayer</div>
+        </div>
+      </div><div class="task-item " data-idx="28" style="border-left-color:#7c6fff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">9:15 PM</span>
+            <span class="task-dur">60 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">💻 Udemy Course — Video lessons</div>
+        </div>
+      </div><div class="task-item " data-idx="29" style="border-left-color:#00e5b0">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">10:15 PM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🇩🇪 Deutsch — Writing (copy sentences, fill exercises)</div>
+        </div>
+      </div><div class="task-item " data-idx="30" style="border-left-color:#b8a4ff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">10:45 PM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🇬🇧 English — Vocabulary + grammar review</div>
+        </div>
+      </div><div class="task-item " data-idx="31" style="border-left-color:#5ba4f5">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">11:15 PM</span>
+            <span class="task-dur">45 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">😴 Sleep Block 2 — REST (45 min nap)</div>
+        </div>
+      </div><div class="task-item " data-idx="32" style="border-left-color:#7a7a9a">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">12:00 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">📋 Daily Review — Tick Notion checklist, feel proud</div>
+        </div>
+      </div><div class="task-item " data-idx="33" style="border-left-color:#b8a4ff">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">12:30 AM</span>
+            <span class="task-dur">30 min</span>
+            
+          </div>
+          <div class="task-text">🎧 Light listening — English or Deutsch (wind down)</div>
+        </div>
+      </div><div class="task-item " data-idx="34" style="border-left-color:#ffd166">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">1:00 AM</span>
+            <span class="task-dur">20 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">🕌 Witr Prayer</div>
+        </div>
+      </div><div class="task-item " data-idx="35" style="border-left-color:#5ba4f5">
+        <div class="task-checkbox"></div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">1:30 AM</span>
+            <span class="task-dur">150 min</span>
+            <span class="badge-critical">CRITICAL</span>
+          </div>
+          <div class="task-text">😴 MAIN SLEEP — 1:30 AM → 4:00 AM</div>
+        </div>
+      </div><div style="height:20px"></div></div>
+</div>
+
+<!-- INSTALL BANNER -->
+<div class="install-banner" id="installBanner" style="display:none">
+  <div class="install-text">📲 <strong>Install as App</strong><br>Add to home screen — works offline</div>
+  <button class="install-btn" id="installBtn">Install App</button>
+  <button class="install-close" onclick="document.getElementById(&#39;installBanner&#39;).style.display=&#39;none&#39;">×</button>
+</div>
+
+<script>
+// ─── DATA ───────────────────────────────────────────────────────────────────
+
+const SCHEDULE = [
+  { time:"4:00 AM", dur:"25 min", task:"🌅 WAKE UP — Cold water, brush, freshen up", cat:"routine", crit:true },
+  { time:"4:25 AM", dur:"20 min", task:"🕌 Fajr Prayer + Duaa", cat:"prayer", crit:true },
+  { time:"4:45 AM", dur:"30 min", task:"📖 Reading — Session 1 (20 pages)", cat:"reading", crit:false },
+  { time:"5:15 AM", dur:"15 min", task:"🇩🇪 Deutsch — Vocabulary (Anki, 20 new words)", cat:"deutsch", crit:false },
+  { time:"5:30 AM", dur:"30 min", task:"🇬🇧 English — Podcast listening (no phone, just listen)", cat:"english", crit:false },
+  { time:"6:00 AM", dur:"90 min", task:"💻 ISTQB Study — Deep focus (chapter of the week)", cat:"career", crit:true },
+  { time:"7:30 AM", dur:"30 min", task:"🚶 Morning Walk — outdoors, no phone", cat:"health", crit:false },
+  { time:"8:00 AM", dur:"30 min", task:"🥗 Breakfast — High protein meal", cat:"diet", crit:false },
+  { time:"8:30 AM", dur:"60 min", task:"💻 Tools Study — Postman / Selenium / IBM DOORS", cat:"career", crit:true },
+  { time:"9:30 AM", dur:"45 min", task:"🇩🇪 Deutsch — Grammar lesson (YouTube)", cat:"deutsch", crit:false },
+  { time:"10:15 AM", dur:"30 min", task:"🇬🇧 English — Speaking practice (shadowing, repeat aloud)", cat:"english", crit:false },
+  { time:"10:45 AM", dur:"30 min", task:"📖 Reading — Session 2 (20 pages)", cat:"reading", crit:false },
+  { time:"11:15 AM", dur:"60 min", task:"🏋️ GYM — Follow weekly split", cat:"workout", crit:false },
+  { time:"12:15 PM", dur:"20 min", task:"🍗 Post-workout meal — protein + carbs", cat:"diet", crit:false },
+  { time:"12:35 PM", dur:"20 min", task:"🕌 Dhuhr Prayer + rest", cat:"prayer", crit:true },
+  { time:"12:55 PM", dur:"90 min", task:"😴 Sleep Block 1 — REST (90 minutes)", cat:"sleep", crit:true },
+  { time:"2:25 PM", dur:"60 min", task:"💻 Python for Testing — pytest, scripts", cat:"career", crit:true },
+  { time:"3:25 PM", dur:"30 min", task:"🇩🇪 Deutsch — Listening (Easy German YouTube)", cat:"deutsch", crit:false },
+  { time:"3:55 PM", dur:"30 min", task:"🇬🇧 English — Writing practice (1 paragraph journal)", cat:"english", crit:false },
+  { time:"4:25 PM", dur:"10 min", task:"🕌 Asr Prayer", cat:"prayer", crit:true },
+  { time:"4:35 PM", dur:"40 min", task:"📖 Reading — Session 3 (20 pages)", cat:"reading", crit:false },
+  { time:"5:15 PM", dur:"30 min", task:"🎧 Deutsch — Podcast / audio story (passive)", cat:"deutsch", crit:false },
+  { time:"5:45 PM", dur:"60 min", task:"💻 Mock Testing / Practice ISTQB questions", cat:"career", crit:true },
+  { time:"6:45 PM", dur:"45 min", task:"🥩 Dinner — lean protein + vegetables", cat:"diet", crit:false },
+  { time:"7:40 PM", dur:"15 min", task:"🕌 Maghrib Prayer + Duaa", cat:"prayer", crit:true },
+  { time:"7:45 PM", dur:"30 min", task:"🇩🇪 Deutsch — Speaking (repeat sentences aloud, record)", cat:"deutsch", crit:false },
+  { time:"8:15 PM", dur:"45 min", task:"🇬🇧 English — YouTube native content (no subtitles)", cat:"english", crit:false },
+  { time:"9:10 PM", dur:"10 min", task:"🕌 Isha Prayer", cat:"prayer", crit:true },
+  { time:"9:15 PM", dur:"60 min", task:"💻 Udemy Course — Video lessons", cat:"career", crit:true },
+  { time:"10:15 PM", dur:"30 min", task:"🇩🇪 Deutsch — Writing (copy sentences, fill exercises)", cat:"deutsch", crit:false },
+  { time:"10:45 PM", dur:"30 min", task:"🇬🇧 English — Vocabulary + grammar review", cat:"english", crit:false },
+  { time:"11:15 PM", dur:"45 min", task:"😴 Sleep Block 2 — REST (45 min nap)", cat:"sleep", crit:true },
+  { time:"12:00 AM", dur:"30 min", task:"📋 Daily Review — Tick Notion checklist, feel proud", cat:"routine", crit:false },
+  { time:"12:30 AM", dur:"30 min", task:"🎧 Light listening — English or Deutsch (wind down)", cat:"english", crit:false },
+  { time:"1:00 AM", dur:"20 min", task:"🕌 Witr Prayer", cat:"prayer", crit:true },
+  { time:"1:30 AM", dur:"150 min", task:"😴 MAIN SLEEP — 1:30 AM → 4:00 AM", cat:"sleep", crit:true },
+];
+
+const WEEK = [
+  { day:"SAT", gym:"Upper — Push (Chest, Shoulders, Triceps)", testing:"ISTQB Ch.1–2 + Postman intro", deutsch:"A1 review + 20 new vocab", english:"Shadowing session 1" },
+  { day:"SUN", gym:"Lower (Quads, Hamstrings, Glutes)", testing:"ISTQB Ch.3–4 + Postman practice", deutsch:"A1→A2 Grammar lesson", english:"Writing journal" },
+  { day:"MON", gym:"Pull — Back + Biceps (V-shape priority)", testing:"ISTQB Ch.5 + Selenium intro", deutsch:"Listening — Easy German ep 1–3", english:"Podcast (no subtitles)" },
+  { day:"TUE", gym:"Upper — Anterior/Posterior split", testing:"ISTQB mock test + review weak areas", deutsch:"Speaking — record yourself", english:"Shadowing session 2" },
+  { day:"WED", gym:"REST or light walk only", testing:"Python for testing — pytest basics", deutsch:"A2 new grammar topic", english:"YouTube native content" },
+  { day:"THU", gym:"Lower — X split", testing:"IBM DOORS intro + Selenium practice", deutsch:"Full review — vocab + grammar", english:"Full speaking session" },
+  { day:"FRI", gym:"Full body light / active recovery", testing:"Full mock ISTQB exam (timed)", deutsch:"Free Deutsch media (movie/show)", english:"Free speaking — talk to yourself" },
+];
+
+const MONTH = [
+  { wk:"Week 1", col:"#7c6fff", career:"ISTQB Ch.1–5, Postman basics, Selenium intro", deutsch:"A1 full review + A2 start (140 vocab)", english:"Shadowing daily, 7 journal entries", body:"Establish gym habit, track diet", reading:"~140 pages per book" },
+  { wk:"Week 2", col:"#00e5b0", career:"ISTQB Ch.6–10, Postman API testing, Python pytest", deutsch:"A2 grammar deep dive + 140 new vocab", english:"No-subtitle listening, speaking daily", body:"V-shape focus, progressive overload", reading:"~140 pages per book" },
+  { wk:"Week 3", col:"#ffd166", career:"IBM DOORS, Selenium scripts, full mock tests", deutsch:"A2 consolidation + B1 intro", english:"Full conversations, write paragraphs", body:"Diet locked in, strength gains visible", reading:"~140 pages per book" },
+  { wk:"Week 4", col:"#ff5f5f", career:"INTERVIEW PREP — mock Q&A, review all tools", deutsch:"B1 basics + full 4-week review", english:"Professional English — interview vocab", body:"Measure progress, adjust plan", reading:"Finish all 3 books ✅" },
+];
+
+const DIET = [
+  { time:"4:45 AM", name:"Pre-workout", items:"2 eggs + oats + banana + 500ml water" },
+  { time:"8:00 AM", name:"Breakfast", items:"3 eggs + whole bread + cheese + green tea" },
+  { time:"12:15 PM", name:"Post-workout meal", items:"Chicken breast 200g + rice + salad + water" },
+  { time:"3:30 PM", name:"Snack", items:"Yogurt + handful of nuts + fruit" },
+  { time:"6:45 PM", name:"Dinner", items:"Fish or beef 150g + vegetables + olive oil" },
+  { time:"11:00 PM", name:"Pre-sleep", items:"Cottage cheese or casein-rich food + water" },
+];
+
+const REMINDERS = [
+  { time:"4:00 AM", label:"🌅 WAKE UP — GET UP NOW", repeat:"Daily" },
+  { time:"4:25 AM", label:"🕌 Fajr Prayer", repeat:"Daily" },
+  { time:"6:00 AM", label:"💻 ISTQB Study — deep focus starts", repeat:"Daily" },
+  { time:"8:30 AM", label:"💻 Tools — Postman / Selenium / DOORS", repeat:"Daily" },
+  { time:"11:15 AM", label:"🏋️ GYM TIME", repeat:"Daily" },
+  { time:"12:35 PM", label:"🕌 Dhuhr Prayer", repeat:"Daily" },
+  { time:"12:55 PM", label:"😴 Sleep Block 1 — rest now", repeat:"Daily" },
+  { time:"2:25 PM", label:"💻 Python for Testing", repeat:"Daily" },
+  { time:"4:25 PM", label:"🕌 Asr Prayer", repeat:"Daily" },
+  { time:"5:45 PM", label:"💻 Mock ISTQB practice", repeat:"Daily" },
+  { time:"7:40 PM", label:"🕌 Maghrib Prayer", repeat:"Daily" },
+  { time:"9:10 PM", label:"🕌 Isha Prayer", repeat:"Daily" },
+  { time:"9:15 PM", label:"💻 Udemy Course block", repeat:"Daily" },
+  { time:"12:00 AM", label:"📋 Daily Review — open Notion", repeat:"Daily" },
+  { time:"1:00 AM", label:"🕌 Witr Prayer", repeat:"Daily" },
+  { time:"1:30 AM", label:"😴 MAIN SLEEP — phone down NOW", repeat:"Daily" },
+];
+
+const CAT_COLORS = {
+  prayer:"#ffd166", career:"#7c6fff", deutsch:"#00e5b0", english:"#b8a4ff",
+  workout:"#ff5f5f", reading:"#ff9a3c", sleep:"#5ba4f5", diet:"#1dce7a",
+  routine:"#7a7a9a", health:"#2de0a5"
+};
+
+const RULES = [
+  "4:00 AM alarm = GET UP. No negotiation. No snooze. The entire system starts here.",
+  "Prayers are LOCKED. They cannot be moved, skipped, or shortened. Everything bends around them.",
+  "Check Notion every night at midnight — tick what's done, move what isn't, feel proud of wins.",
+  "Missing a task ≠ failure. It moves to tomorrow. The system catches it. Just keep going.",
+  "When you feel lazy: open Notion, pick the smallest task, start. Starting is the only cure.",
+  "Phone is a tool, not entertainment. During study/reading/gym: face-down, silent.",
+  "One day at a time. Don't think about the whole month — just today's checklist.",
+  "Every Friday night: Weekly Review. Non-negotiable. Course-correct before things go wrong.",
+  "Stuck on ISTQB, Deutsch, or anything? Ask Claude immediately. Don't waste hours alone.",
+  "Every task completed is a brick. Every brick builds the person you want to be. Build.",
+];
+
+// ─── STATE ──────────────────────────────────────────────────────────────────
+
+const todayKey = () => new Date().toISOString().split('T')[0];
+
+function loadChecked() {
+  try {
+    const raw = localStorage.getItem('ls_checked_' + todayKey());
+    return raw ? JSON.parse(raw) : {};
+  } catch(e) { return {}; }
+}
+
+function saveChecked(obj) {
+  try { localStorage.setItem('ls_checked_' + todayKey(), JSON.stringify(obj)); } catch(e) {}
+}
+
+let checked = loadChecked();
+let activeTab = 'schedule';
+
+// ─── HEADER ─────────────────────────────────────────────────────────────────
+
+function updateHeader() {
+  const now = new Date();
+  const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  document.getElementById('headerDate').innerHTML =
+    days[now.getDay()] + '<br>' + now.getDate() + ' ' + months[now.getMonth()];
+
+  const startDate = new Date('2026-05-14');
+  const deadline = new Date(startDate.getTime() + 30 * 24 * 60 * 60 * 1000);
+  const diff = Math.max(0, Math.ceil((deadline - now) / (1000 * 60 * 60 * 24)));
+  document.getElementById('daysLeft').textContent = diff;
+
+  const done = Object.values(checked).filter(Boolean).length;
+  const total = SCHEDULE.length;
+  const pct = Math.round((done / total) * 100);
+  document.getElementById('progressLabel').textContent = done + ' / ' + total + ' tasks';
+  document.getElementById('progressFill').style.width = pct + '%';
+}
+
+// ─── TABS ────────────────────────────────────────────────────────────────────
+
+function showTab(tab) {
+  activeTab = tab;
+  document.querySelectorAll('.nav-btn').forEach((b,i) => {
+    const tabs = ['schedule','week','month','diet','reminders','setup','rules'];
+    b.classList.toggle('active', tabs[i] === tab);
+  });
+  renderContent();
+  document.getElementById('contentArea').scrollTop = 0;
+}
+
+function renderContent() {
+  const area = document.getElementById('contentArea');
+  const fns = { schedule:renderSchedule, week:renderWeek, month:renderMonth, diet:renderDiet, reminders:renderReminders, setup:renderSetup, rules:renderRules };
+  area.innerHTML = (fns[activeTab] || renderSchedule)();
+  bindTaskClicks();
+}
+
+// ─── SCHEDULE ────────────────────────────────────────────────────────────────
+
+function renderSchedule() {
+  const done = Object.values(checked).filter(Boolean).length;
+  const total = SCHEDULE.length;
+
+  const sections = [
+    { label: "🌅 Morning Block — 4:00 AM to 12:00 PM", range: [0, 13] },
+    { label: "🌞 Afternoon Block — 12:35 PM to 5:30 PM", range: [14, 21] },
+    { label: "🌆 Evening Block — 5:45 PM to 1:30 AM", range: [22, 35] },
+  ];
+
+  let html = `<div class="done-counter">
+    <div class="done-text">✅ <strong>${done}</strong> / ${total} done today</div>
+    <button class="reset-btn" onclick="resetDay()">Reset day</button>
+  </div>`;
+
+  sections.forEach(s => {
+    html += `<div class="section-label">${s.label}</div>`;
+    for (let i = s.range[0]; i <= Math.min(s.range[1], SCHEDULE.length - 1); i++) {
+      const t = SCHEDULE[i];
+      const isDone = checked[i];
+      const col = CAT_COLORS[t.cat] || '#7a7a9a';
+      html += `<div class="task-item ${isDone ? 'done' : ''}" data-idx="${i}" style="border-left-color:${col}">
+        <div class="task-checkbox">${isDone ? '✓' : ''}</div>
+        <div style="flex:1">
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <span class="task-time">${t.time}</span>
+            <span class="task-dur">${t.dur}</span>
+            ${t.crit ? '<span class="badge-critical">CRITICAL</span>' : ''}
+          </div>
+          <div class="task-text">${t.task}</div>
+        </div>
+      </div>`;
+    }
+  });
+
+  html += `<div style="height:20px"></div>`;
+  return html;
+}
+
+function bindTaskClicks() {
+  document.querySelectorAll('.task-item[data-idx]').forEach(el => {
+    el.addEventListener('click', () => {
+      const i = parseInt(el.dataset.idx);
+      checked[i] = !checked[i];
+      saveChecked(checked);
+      updateHeader();
+      renderContent();
+    });
+  });
+}
+
+function resetDay() {
+  if (confirm('Reset all tasks for today?')) {
+    checked = {};
+    saveChecked(checked);
+    updateHeader();
+    renderContent();
+  }
+}
+
+// ─── WEEKLY ──────────────────────────────────────────────────────────────────
+
+function renderWeek() {
+  const colors = ['#7c6fff','#00e5b0','#ff5f5f','#ffd166','#b8a4ff','#ff9a3c','#1dce7a'];
+  return WEEK.map((d, i) => `
+    <div class="week-card">
+      <div class="week-card-header">
+        <div class="week-day-badge" style="background:${colors[i]}22;color:${colors[i]}">${d.day}</div>
+        <span style="font-size:14px">${['Saturday','Sunday','Monday','Tuesday','Wednesday','Thursday','Friday'][i]}</span>
+      </div>
+      <div class="week-card-body">
+        <div class="week-mini"><div class="week-mini-label" style="color:#ff5f5f">🏋️ GYM</div><div class="week-mini-val">${d.gym}</div></div>
+        <div class="week-mini"><div class="week-mini-label" style="color:#7c6fff">💻 TESTING</div><div class="week-mini-val">${d.testing}</div></div>
+        <div class="week-mini"><div class="week-mini-label" style="color:#00e5b0">🇩🇪 DEUTSCH</div><div class="week-mini-val">${d.deutsch}</div></div>
+        <div class="week-mini"><div class="week-mini-label" style="color:#b8a4ff">🇬🇧 ENGLISH</div><div class="week-mini-val">${d.english}</div></div>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ─── MONTH ───────────────────────────────────────────────────────────────────
+
+function renderMonth() {
+  return `
+    <div class="info-box red" style="margin-bottom:16px">
+      <div class="info-box-title">⚠️ Honesty Note</div>
+      <p>600 pages × 3 books = 1,800 pages in 30 days = 60 pages/day. Missing even 3 days = 180 pages to catch up. Zero missed reading days required.</p>
+    </div>
+  ` + MONTH.map((w, i) => `
+    <div class="month-card" style="border-left:4px solid ${w.col}">
+      <div class="month-card-header">
+        <div class="month-num" style="background:${w.col}22;color:${w.col}">${i+1}</div>
+        <span style="font-weight:800;font-size:16px">${w.wk}</span>
+      </div>
+      <div class="month-card-body">
+        <div class="month-row"><span class="month-icon">💻 Career</span><span>${w.career}</span></div>
+        <div class="month-row"><span class="month-icon">🇩🇪 Deutsch</span><span>${w.deutsch}</span></div>
+        <div class="month-row"><span class="month-icon">🇬🇧 English</span><span>${w.english}</span></div>
+        <div class="month-row"><span class="month-icon">🏋️ Body</span><span>${w.body}</span></div>
+        <div class="month-row"><span class="month-icon">📖 Reading</span><span>${w.reading}</span></div>
+      </div>
+    </div>
+  `).join('');
+}
+
+// ─── DIET ────────────────────────────────────────────────────────────────────
+
+function renderDiet() {
+  const meals = DIET.map(m => `
+    <div class="meal-card">
+      <div class="meal-time-badge">${m.time}</div>
+      <div><div class="meal-name">${m.name}</div><div class="meal-items">${m.items}</div></div>
+    </div>
+  `).join('');
+
+  return `
+    <div class="info-box green">
+      <div class="info-box-title">⚠️ Important — Verify calories</div>
+      <p>These are general guidelines. Search "TDEE calculator" online, enter your weight and height, and adjust portion sizes to match your personal calorie target. I don't have your measurements so I cannot calculate this exactly.</p>
+    </div>
+    ${meals}
+    <div class="card">
+      <div class="card-title">🏋️ V-Shape Rules</div>
+      ${['Shoulders + Back = the V — priority in every upper session',
+        'Lateral raises: 4 sets × 15 reps every shoulder day — most important exercise',
+        'Protein target: ~1.6–2g per kg of your bodyweight daily',
+        'No junk food, no sugary drinks — water is your main drink',
+        'Track workouts in Notion — increase weight/reps every week',
+        'Sleep blocks are when you grow — protect them like prayers'
+      ].map(r => `<div class="rule-item"><span class="rule-num">→</span><span>${r}</span></div>`).join('')}
+    </div>
+    <div style="height:20px"></div>
+  `;
+}
+
+// ─── REMINDERS ───────────────────────────────────────────────────────────────
+
+function renderReminders() {
+  return `
+    <div class="info-box purple">
+      <div class="info-box-title">📱 How to set up on iPhone</div>
+      <ol>
+        <li>Open <strong>Clock app</strong> → Alarm → + → set time → label it → Repeat: Every Day</li>
+        <li>Open <strong>Reminders app</strong> → New List "Daily System" → add each one with time → repeat daily</li>
+        <li>Both trigger = Clock wakes you, Reminders reminds you of the task</li>
+      </ol>
+    </div>
+    ${REMINDERS.map(r => `
+      <div class="reminder-item">
+        <div>
+          <div class="reminder-time">${r.time}</div>
+          <div class="reminder-label">${r.label}</div>
+        </div>
+        <div class="repeat-badge">${r.repeat}</div>
+      </div>
+    `).join('')}
+    <div class="info-box purple" style="margin-top:16px">
+      <div class="info-box-title">🖥️ Windows sync via Google Calendar</div>
+      <ol>
+        <li>Go to <strong>calendar.google.com</strong> on Windows</li>
+        <li>Create calendar: "⚡ Life System"</li>
+        <li>Add each alarm as a recurring daily event with 0-min notification</li>
+        <li>On iPhone: Settings → Calendar → Accounts → Add Google → sign in</li>
+        <li>Done — synced on both devices ✅</li>
+      </ol>
+    </div>
+    <div style="height:20px"></div>
+  `;
+}
+
+// ─── SETUP ───────────────────────────────────────────────────────────────────
+
+function renderSetup() {
+  const isIOS = /iphone|ipad/i.test(navigator.userAgent);
+  const isWindows = /windows/i.test(navigator.userAgent);
+
+  const iosInstructions = `
+    <div class="info-box green">
+      <div class="info-box-title">📱 Install on iPhone (you are on iPhone)</div>
+      <ol>
+        <li>Tap the <strong>Share button</strong> (box with arrow) at the bottom of Safari</li>
+        <li>Scroll down and tap <strong>"Add to Home Screen"</strong></li>
+        <li>Name it <strong>"Life System"</strong> → tap Add</li>
+        <li>Done! App icon appears on your home screen ✅</li>
+        <li>Open it from home screen — works like a real app, offline too</li>
+      </ol>
+    </div>`;
+
+  const windowsInstructions = `
+    <div class="info-box purple">
+      <div class="info-box-title">🖥️ Install on Windows (you are on Windows)</div>
+      <ol>
+        <li>Open this file in <strong>Google Chrome or Microsoft Edge</strong></li>
+        <li>Click the <strong>install icon</strong> (⊕) in the address bar</li>
+        <li>Or: Menu (⋮) → <strong>"Install Life System"</strong> or "Add to desktop"</li>
+        <li>Done — app opens like a native window, no browser bar ✅</li>
+      </ol>
+    </div>`;
+
+  const genericInstructions = `
+    <div class="info-box green">
+      <div class="info-box-title">📱 Install on iPhone</div>
+      <ol>
+        <li>Open this file in <strong>Safari</strong> (not Chrome)</li>
+        <li>Tap the Share button (box with arrow) → <strong>"Add to Home Screen"</strong></li>
+        <li>Name it "Life System" → tap Add</li>
+        <li>Open from home screen — works offline ✅</li>
+      </ol>
+    </div>
+    <div class="info-box purple">
+      <div class="info-box-title">🖥️ Install on Windows</div>
+      <ol>
+        <li>Open this file in <strong>Google Chrome or Edge</strong></li>
+        <li>Click install icon (⊕) in address bar or Menu → Install</li>
+        <li>App opens as standalone window ✅</li>
+      </ol>
+    </div>`;
+
+  return `
+    <div class="info-box yellow">
+      <div class="info-box-title">⚡ How This App Works</div>
+      <p>This is a <strong>Progressive Web App (PWA)</strong>. It installs directly on your iPhone home screen and Windows desktop — looks and feels like a real app, works offline, remembers your checked tasks automatically via local storage. 100% free, no account needed.</p>
+    </div>
+
+    ${isIOS ? iosInstructions : isWindows ? windowsInstructions : genericInstructions}
+
+    <div class="card" style="margin-top:4px">
+      <div class="card-title">📋 Notion Setup (one time)</div>
+      ${[
+        { t:"Go to notion.so", d:"Sign up free with your email" },
+        { t:"Create page: ⚡ MY LIFE SYSTEM — 2026", d:"This is your master dashboard" },
+        { t:"Add Daily Checklist database", d:"All 35 daily tasks as checkboxes" },
+        { t:"Add Goals Tracker", d:"Career / Deutsch / English / Body — with progress %" },
+        { t:"Add Weekly Review page", d:"Every Friday night — fill in what was done" },
+        { t:"Install Notion on iPhone", d:"App Store → Notion (free) — same account, fully synced" },
+      ].map((s,i) => `
+        <div class="setup-step">
+          <div class="step-num">${i+1}</div>
+          <div><div class="step-title">${s.t}</div><div class="step-desc">${s.d}</div></div>
+        </div>
+      `).join('')}
+    </div>
+    <div style="height:20px"></div>
+  `;
+}
+
+// ─── RULES ───────────────────────────────────────────────────────────────────
+
+function renderRules() {
+  return `
+    <div class="info-box red">
+      <div class="info-box-title">🧠 Your 10 Non-Negotiable Rules</div>
+      <p style="color:var(--muted2);margin-bottom:12px;font-size:12px">Read these every morning. They are the system behind the system.</p>
+    </div>
+    <div class="card">
+      ${RULES.map((r, i) => `
+        <div class="rule-item">
+          <span class="rule-num">${i+1}</span>
+          <span>${r}</span>
+        </div>
+      `).join('')}
+    </div>
+    <div class="info-box green" style="margin-top:4px">
+      <div class="info-box-title">💬 You Are Not Alone</div>
+      <p>Any time you are stuck — ISTQB question, Deutsch grammar, English practice, diet question, motivation — open Claude and ask. It is faster than searching for hours. Use it as your personal coach, study partner, and tutor.</p>
+    </div>
+    <div style="height:20px"></div>
+  `;
+}
+
+// ─── PWA / INSTALL ───────────────────────────────────────────────────────────
+
+let deferredPrompt = null;
+
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  deferredPrompt = e;
+  const banner = document.getElementById('installBanner');
+  banner.style.display = 'flex';
+  // Add padding to content so banner doesn't cover tasks
+  document.getElementById('contentArea').style.paddingBottom = '80px';
+});
+
+document.getElementById('installBtn').addEventListener('click', async () => {
+  if (deferredPrompt) {
+    deferredPrompt.prompt();
+    const { outcome } = await deferredPrompt.userChoice;
+    if (outcome === 'accepted') {
+      document.getElementById('installBanner').style.display = 'none';
+    }
+    deferredPrompt = null;
+  }
+});
+
+window.addEventListener('appinstalled', () => {
+  document.getElementById('installBanner').style.display = 'none';
+});
+
+// ─── SERVICE WORKER (inline, for offline support) ───────────────────────────
+
+const SW_CODE = `
+const CACHE = 'life-system-v1';
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(CACHE).then(c => c.addAll(['./', './life-system-app.html'])));
+  self.skipWaiting();
+});
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))));
+  self.clients.claim();
+});
+self.addEventListener('fetch', e => {
+  e.respondWith(caches.match(e.request).then(r => r || fetch(e.request).catch(() => caches.match('./life-system-app.html'))));
+});
+`;
+
+if ('serviceWorker' in navigator) {
+  const blob = new Blob([SW_CODE], { type: 'application/javascript' });
+  const swUrl = URL.createObjectURL(blob);
+  navigator.serviceWorker.register(swUrl).catch(() => {});
+}
+
+// ─── INIT ────────────────────────────────────────────────────────────────────
+
+updateHeader();
+renderContent();
+setInterval(updateHeader, 60000);
+</script>
+
+
+</body></html>
